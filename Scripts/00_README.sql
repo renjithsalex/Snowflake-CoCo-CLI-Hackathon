@@ -69,8 +69,12 @@
 -- ├───────────────────────────────────────────────────────────────────────────┤
 -- │                                                                          │
 -- │  11_cost_control/                                                         │
--- │    └── cost_control.sql             Resource monitor, credit tracking,   │
--- │                                     warehouse sizing, cost breakdown     │
+-- │    ├── cost_control.sql             Resource monitor, credit tracking    │
+-- │    ├── suspend_tasks.sql            Stop 3 tasks + alert ($0 task cost) │
+-- │    ├── suspend_warehouse.sql        Force warehouse off ($0 compute)    │
+-- │    ├── suspend_dynamic_tables.sql   Stop 8 DT auto-refreshes           │
+-- │    ├── resume_tasks.sql             Restart tasks + alert               │
+-- │    └── resume_dynamic_tables.sql    Restart DT auto-refreshes          │
 -- │                                                                          │
 -- ├───────────────────────────────────────────────────────────────────────────┤
 -- │                     EXPLORATION & DEBUGGING                              │
@@ -104,5 +108,171 @@
 --
 --   STREAMLIT APP reads from: DT_ASSET_HEALTH, DT_OEE_*, DT_DOWNTIME_PARETO,
 --     DT_ASSET_360, ANOMALY_SCORES, ALERT_HISTORY, WORK_ORDER_DRAFTS
+--
+--
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- HOW DYNAMIC TABLE AUTO-REFRESH WORKS
+-- ═══════════════════════════════════════════════════════════════════════════════
+--
+-- Dynamic Tables (DTs) are Snowflake's zero-ETL pipeline. They replace
+-- traditional ETL jobs (Airflow DAGs, dbt runs, cron scripts) with a
+-- declarative SQL definition that Snowflake keeps fresh automatically.
+--
+-- ─── KEY CONCEPTS ────────────────────────────────────────────────────────────
+--
+--   1. DECLARATIVE: You write SELECT, Snowflake handles the rest.
+--      No scheduling logic, no retry handling, no dependency graphs.
+--
+--   2. CHANGE TRACKING: Snowflake internally tracks which rows changed
+--      in the source tables (like an invisible stream). When changes
+--      are detected, the DT re-evaluates its query and updates.
+--
+--   3. TARGET_LAG: Controls how stale data is allowed to be.
+--      - '2 minutes'  → Snowflake ensures data is never more than 2 min old
+--      - '5 minutes'  → up to 5 min staleness allowed (cheaper, batches more)
+--      - 'DOWNSTREAM' → no independent schedule; refreshes only when a
+--                        downstream DT with a time-based lag needs fresh data
+--
+--   4. WAREHOUSE: Each DT uses a warehouse to run its refresh query.
+--      The warehouse spins up, runs the query, then auto-suspends.
+--
+-- ─── DEPENDENCY CHAIN (this project) ─────────────────────────────────────────
+--
+--   RAW.SENSOR_READINGS (new rows from TASK_STREAM_SENSORS every 1 min)
+--     │
+--     ▼ change detected
+--   DT_SENSOR_CLEAN (DOWNSTREAM) ─ dedup, cleanse, forward-fill nulls
+--     │
+--     ▼ change detected
+--   DT_SENSOR_FEATURES_15M (DOWNSTREAM) ─ 15-min aggregated features
+--     │
+--     ▼ change detected
+--   DT_ASSET_HEALTH (2 min lag) ─ combines rule thresholds + ML scores
+--     │
+--     ▼ read by Streamlit, Cortex Agent, Semantic View
+--
+--   RAW.PRODUCTION_ORDERS (static, loaded once)
+--     │
+--     ▼
+--   DT_OEE_SHIFT (5 min) → DT_OEE_LINE_DAILY (5 min) → DT_OEE_PLANT_DAILY
+--
+--   RAW.* (multiple tables)
+--     │
+--     ▼
+--   DT_ASSET_360 (5 min) ─ 30-day MTBF, MTTR, costs, spare parts
+--   DT_DOWNTIME_PARETO (5 min) ─ downtime by reason code
+--
+-- ─── REFRESH MODES ───────────────────────────────────────────────────────────
+--
+--   FULL:        Re-runs the entire query from scratch. Used when the query
+--                is too complex for incremental (e.g., window functions,
+--                non-deterministic functions like CURRENT_DATE()).
+--                All 8 DTs in this project use FULL mode.
+--
+--   INCREMENTAL: Only processes new/changed rows. Much faster and cheaper
+--                for simple queries (filters, joins, aggregations).
+--                Not used here due to query complexity.
+--
+-- ─── COST MODEL ──────────────────────────────────────────────────────────────
+--
+--   DT refresh cost = warehouse runtime during the refresh query.
+--
+--   ┌─────────────────────────┬──────────┬─────────────┬──────────────────────┐
+--   │ DT                      │ Rows     │ Refresh Time│ Approx Cost/Refresh  │
+--   ├─────────────────────────┼──────────┼─────────────┼──────────────────────┤
+--   │ DT_SENSOR_CLEAN         │ 1.5M+    │ 15-30s      │ ~0.02 credits (MED)  │
+--   │ DT_SENSOR_FEATURES_15M  │ 500K+    │ 10-20s      │ ~0.01 credits        │
+--   │ DT_ASSET_HEALTH         │ 60       │ 2-5s        │ ~0.005 credits       │
+--   │ DT_OEE_SHIFT            │ 2,160    │ 1-3s        │ ~0.003 credits       │
+--   │ DT_OEE_LINE_DAILY       │ 720      │ 1-2s        │ ~0.002 credits       │
+--   │ DT_OEE_PLANT_DAILY      │ 270      │ 1-2s        │ ~0.002 credits       │
+--   │ DT_ASSET_360            │ 60       │ 2-5s        │ ~0.005 credits       │
+--   │ DT_DOWNTIME_PARETO      │ 36       │ 1-2s        │ ~0.002 credits       │
+--   ├─────────────────────────┼──────────┼─────────────┼──────────────────────┤
+--   │ TOTAL per refresh cycle │          │ ~30-70s     │ ~0.05 credits        │
+--   │ DAILY (refreshing every │          │             │ ~1 credit/day        │
+--   │   few minutes)          │          │             │ ~$3-4/day            │
+--   └─────────────────────────┴──────────┴─────────────┴──────────────────────┘
+--
+-- ─── SUSPEND / RESUME ────────────────────────────────────────────────────────
+--
+--   ALTER DYNAMIC TABLE <name> SUSPEND;  -- stops auto-refresh, keeps data
+--   ALTER DYNAMIC TABLE <name> RESUME;   -- restarts auto-refresh
+--   ALTER DYNAMIC TABLE <name> REFRESH;  -- one-time manual refresh
+--
+--   See: 11_cost_control/suspend_dynamic_tables.sql
+--        11_cost_control/resume_dynamic_tables.sql
+--
+-- ─── KEY INSIGHT ─────────────────────────────────────────────────────────────
+--
+--   If you suspend tasks (no new sensor data), DTs detect "no changes"
+--   and skip their refresh. So suspending tasks ALONE effectively stops
+--   DT cost too — suspending DTs explicitly is only needed for guaranteed
+--   zero spend during extended shutdowns.
+--
+--
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- COST CHEAT SHEET (what to run when)
+-- ═══════════════════════════════════════════════════════════════════════════════
+--
+-- ┌────────────────────────────────────────┬─────────────┬───────────────────┐
+-- │ I want to...                           │ Run this    │ Credits saved     │
+-- ├────────────────────────────────────────┼─────────────┼───────────────────┤
+-- │ Stop everything for the night          │ suspend_    │ ~$16/day → $0     │
+-- │                                        │ tasks.sql   │                   │
+-- │                                        │             │                   │
+-- │ Stop everything for a week             │ suspend_    │ ~$16/day → $0     │
+-- │                                        │ tasks.sql + │ (guaranteed)      │
+-- │                                        │ suspend_    │                   │
+-- │                                        │ dynamic_    │                   │
+-- │                                        │ tables.sql  │                   │
+-- │                                        │             │                   │
+-- │ Cut cost in half permanently           │ ALTER WH    │ MEDIUM→SMALL      │
+-- │                                        │ SIZE=SMALL  │ ~$8/day savings   │
+-- │                                        │             │                   │
+-- │ Set a hard monthly budget              │ cost_       │ Stops at 150 cr   │
+-- │                                        │ control.sql │ (resource mon.)   │
+-- │                                        │             │                   │
+-- │ See what's costing me money            │ cost_       │ (read-only audit) │
+-- │                                        │ control.sql │                   │
+-- │                                        │ sections 3-6│                   │
+-- │                                        │             │                   │
+-- │ Restart after a shutdown               │ resume_     │ (costs resume)    │
+-- │                                        │ dynamic_    │                   │
+-- │                                        │ tables.sql  │                   │
+-- │                                        │ then        │                   │
+-- │                                        │ resume_     │                   │
+-- │                                        │ tasks.sql   │                   │
+-- └────────────────────────────────────────┴─────────────┴───────────────────┘
+--
+--
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- SNOWFLAKE BILLING PRIMER (for understanding all costs)
+-- ═══════════════════════════════════════════════════════════════════════════════
+--
+-- ┌──────────────────────┬──────────────────────────────────────────────────────┐
+-- │ Cost Type            │ How it works                                         │
+-- ├──────────────────────┼──────────────────────────────────────────────────────┤
+-- │ Warehouse Compute    │ Per-second billing while warehouse is RUNNING.       │
+-- │                      │ Auto-suspends after idle timeout (60s default).      │
+-- │                      │ This is your biggest cost (~80%).                    │
+-- │                      │ Driven by: tasks, DT refreshes, ad-hoc queries.     │
+-- │                      │                                                      │
+-- │ Cloud Services       │ 10% of compute used for query compilation,           │
+-- │                      │ metadata ops, SHOW commands. First 10% free.         │
+-- │                      │ Usually $0 unless heavy metadata operations.         │
+-- │                      │                                                      │
+-- │ Storage              │ $23-40/TB/month for active data.                     │
+-- │                      │ This project: ~2GB → ~$0.05/month (negligible).     │
+-- │                      │                                                      │
+-- │ Serverless Features  │ Cortex Search, Cortex Agent, Cortex Complete —       │
+-- │                      │ billed per-token or per-query, NOT via warehouse.    │
+-- │                      │ Suspending warehouse does NOT stop these costs.      │
+-- │                      │ But they're small (~$0.01-0.10 per query).          │
+-- │                      │                                                      │
+-- │ Streamlit App        │ Runs on compute pool (SYSTEM_COMPUTE_POOL_CPU).     │
+-- │                      │ Billed separately from warehouse. Auto-suspends     │
+-- │                      │ when no users are connected.                         │
+-- └──────────────────────┴──────────────────────────────────────────────────────┘
 --
 -- ═══════════════════════════════════════════════════════════════════════════════
