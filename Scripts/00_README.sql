@@ -1,0 +1,108 @@
+-- =============================================================================
+-- OEE COMMAND CENTER — SCRIPT LIBRARY INDEX
+-- =============================================================================
+-- Master index of all SQL scripts. Execute in numbered order for fresh deploy.
+-- For steady-state operations, use 10_operations/ and 12_adhoc/ scripts.
+-- =============================================================================
+--
+-- ┌───────────────────────────────────────────────────────────────────────────┐
+-- │                        DEPLOYMENT (run in order)                         │
+-- ├───────────────────────────────────────────────────────────────────────────┤
+-- │                                                                          │
+-- │  01_infrastructure/                                                       │
+-- │    └── 01_create_database_schemas.sql   Database + warehouse + 6 schemas │
+-- │                                                                          │
+-- │  02_tables/                                                               │
+-- │    ├── 01_raw_tables.sql               11 RAW source-of-truth tables     │
+-- │    ├── 02_ops_tables.sql               3 OPS tables (alerts, WOs, cfg)   │
+-- │    └── 03_ml_tables.sql                3 ML scoring result tables        │
+-- │                                                                          │
+-- │  03_seed_data/                                                            │
+-- │    ├── 01_reference_data.sql           Plants, lines, 60 assets, parts   │
+-- │    ├── 02_maint_docs.sql               40 maintenance docs (Cortex Srch) │
+-- │    └── 03_synthetic_transactions.sql   Prod orders, downtime, failures   │
+-- │                                                                          │
+-- │  04_stored_procedures/                                                    │
+-- │    └── all_procedures.sql              All 6 SPs with full source        │
+-- │        ├── SP_GENERATE_SENSOR_BATCH    Live streaming (1/min)            │
+-- │        ├── SP_GENERATE_SENSOR_HISTORY  One-time 90-day history           │
+-- │        ├── SP_INJECT_DEGRADATION       Demo degradation patterns         │
+-- │        ├── SP_SCORE_ALL                Anomaly + failure + RUL scoring   │
+-- │        ├── SP_TRIAGE_ALERTS            Alert generation                  │
+-- │        └── SP_GENERATE_WO_DRAFTS       Work order auto-creation         │
+-- │                                                                          │
+-- │  05_dynamic_tables/                                                       │
+-- │    └── all_dynamic_tables.sql          8 DTs in dependency order         │
+-- │        ├── DT_SENSOR_CLEAN             Layer 1: dedup + cleanse          │
+-- │        ├── DT_SENSOR_FEATURES_15M      Layer 2: 15-min aggregates       │
+-- │        ├── DT_ASSET_HEALTH             Layer 3: health score (rules+ML) │
+-- │        ├── DT_OEE_SHIFT / LINE / PLANT OEE pipeline                     │
+-- │        ├── DT_ASSET_360                30-day asset profile              │
+-- │        └── DT_DOWNTIME_PARETO          Downtime by reason code          │
+-- │                                                                          │
+-- │  06_ml_and_views/                                                         │
+-- │    └── ml_training_views.sql           V_AD_TRAIN, V_CLASSIFY_TRAIN     │
+-- │                                                                          │
+-- │  07_ai_services/                                                          │
+-- │    └── cortex_search_and_notes.sql     Cortex Search + SV/Agent notes   │
+-- │                                                                          │
+-- │  08_automation/                                                           │
+-- │    └── tasks_and_alerts.sql            3 tasks + 1 alert (suspended)    │
+-- │                                                                          │
+-- │  09_streamlit/                                                            │
+-- │    └── deploy_app.sql                  Stage + upload + CREATE STREAMLIT │
+-- │                                                                          │
+-- ├───────────────────────────────────────────────────────────────────────────┤
+-- │                     OPERATIONS (run as needed)                            │
+-- ├───────────────────────────────────────────────────────────────────────────┤
+-- │                                                                          │
+-- │  10_operations/                                                           │
+-- │    ├── initial_activation.sql     ★ FIRST TIME: gen data + start tasks  │
+-- │    ├── start_all.sql                Resume all tasks + alert             │
+-- │    ├── stop_all.sql                 Suspend all (stop credit burn)       │
+-- │    ├── refresh_pipeline.sql         Manual full refresh cycle            │
+-- │    ├── health_check.sql             Read-only system status dashboard    │
+-- │    └── reset_data.sql               Clear transient data, keep structure │
+-- │                                                                          │
+-- ├───────────────────────────────────────────────────────────────────────────┤
+-- │                     COST MANAGEMENT                                      │
+-- ├───────────────────────────────────────────────────────────────────────────┤
+-- │                                                                          │
+-- │  11_cost_control/                                                         │
+-- │    └── cost_control.sql             Resource monitor, credit tracking,   │
+-- │                                     warehouse sizing, cost breakdown     │
+-- │                                                                          │
+-- ├───────────────────────────────────────────────────────────────────────────┤
+-- │                     EXPLORATION & DEBUGGING                              │
+-- ├───────────────────────────────────────────────────────────────────────────┤
+-- │                                                                          │
+-- │  12_adhoc/                                                                │
+-- │    └── useful_queries.sql           Fleet overview, OEE analysis,        │
+-- │                                     downtime investigation, ML results,  │
+-- │                                     alerts & WOs, single-asset dive,    │
+-- │                                     degradation demo, spare parts        │
+-- │                                                                          │
+-- └───────────────────────────────────────────────────────────────────────────┘
+--
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- DATA FLOW DIAGRAM
+-- ═══════════════════════════════════════════════════════════════════════════════
+--
+--   TASK_STREAM_SENSORS (1 min)
+--     └→ SP_GENERATE_SENSOR_BATCH → SENSOR_READINGS (RAW)
+--         └→ DT_SENSOR_CLEAN → DT_SENSOR_FEATURES_15M → DT_ASSET_HEALTH
+--
+--   TASK_SCORE_ALL (15 min)
+--     └→ SP_SCORE_ALL
+--         ├→ ANOMALY_SCORES    (statistical z-score)
+--         ├→ FAILURE_PREDICTIONS (composite threshold score)
+--         └→ RUL_ESTIMATES     (linear vibration projection)
+--
+--   TASK_TRIAGE_PIPELINE (15 min)
+--     ├→ SP_TRIAGE_ALERTS     → ALERT_HISTORY
+--     └→ SP_GENERATE_WO_DRAFTS → WORK_ORDER_DRAFTS
+--
+--   STREAMLIT APP reads from: DT_ASSET_HEALTH, DT_OEE_*, DT_DOWNTIME_PARETO,
+--     DT_ASSET_360, ANOMALY_SCORES, ALERT_HISTORY, WORK_ORDER_DRAFTS
+--
+-- ═══════════════════════════════════════════════════════════════════════════════
